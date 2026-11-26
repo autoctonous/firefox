@@ -1,0 +1,93 @@
+name: Spawndroid stress test 2
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: APK URL
+        required: true
+      label:
+        description: Label
+        required: true
+run-name: Stress ${{ inputs.label }}
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      APK_URL: ${{ inputs.apk_url }}
+      SPAWNDROID_API_KEY: ${{ secrets.SPAWNDROID_API_KEY }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Download official release APK
+        run: |
+          date +%s.%N > /tmp/t0
+          curl -fL --retry 3 -o app.apk "$APK_URL"
+          ls -l app.apk; sha256sum app.apk
+          date +%s.%N > /tmp/t_dl
+          BT=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
+          "$ANDROID_HOME/build-tools/$BT/aapt2" dump packagename app.apk | tee /tmp/pkg.txt
+      - name: Write launch test
+        run: |
+          cat > t.mjs <<'JS'
+          import fs from 'node:fs';
+          const base = process.env.SPAWNDROID_WD_URL, pkg = process.env.SPAWNDROID_APP_PACKAGE;
+          fs.mkdirSync('shots', { recursive: true });
+          const call = async (m, p, b) => { const r = await fetch(base + p, { method: m, headers: { 'content-type': 'application/json' }, body: b ? JSON.stringify(b) : undefined }); const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(m + ' ' + p + ' ' + r.status + ' ' + JSON.stringify(j)); return j.value; };
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          const out = []; const check = (n, ok) => { out.push(ok); console.log('CHECK ' + (ok ? 'PASS' : 'FAIL') + ': ' + n); };
+          console.log('T_START', Date.now());
+          const s = await call('POST', '/session', { capabilities: { alwaysMatch: { platformName: 'Android', 'appium:automationName': 'UiAutomator2', 'appium:noReset': true } } });
+          const sid = s.sessionId; let n = 0;
+          const shot = async (name) => { const b = await call('GET', `/session/${sid}/screenshot`); fs.writeFileSync(`shots/${++n}-${name}.png`, Buffer.from(b, 'base64')); const src = await call('GET', `/session/${sid}/source`); console.log('SCREEN ' + name + ': ' + [...src.matchAll(/(?:text|content-desc)="([^"]+)"/g)].map((m) => m[1]).filter((t) => t.trim()).slice(0, 25).join(' | ')); return src; };
+          const ex = (script, a) => call('POST', `/session/${sid}/execute/sync`, { script, args: [a] });
+          const sh = async (c, a) => { try { console.log('SHELL ' + c + ' ' + a.join(' ') + ' => ' + JSON.stringify(await ex('mobile: shell', { command: c, args: a })).slice(0, 200)); } catch (e) { console.log('SHELL ' + c + ' ERR: ' + String(e.message).slice(0, 200)); } };
+          await sh('pm', ['list', 'packages', pkg]); await sh('pm', ['path', pkg]); await sh('getprop', ['ro.product.cpu.abilist']); await sh('ls', ['/data']);
+          try { await ex('mobile: activateApp', { appId: pkg }); } catch (e) {
+            console.log('ACTIVATE_FAILED', String(e.message).slice(0, 300));
+            for (const [n, f] of [['isAppInstalled', () => ex('mobile: isAppInstalled', { appId: pkg })], ['pm list', () => ex('mobile: shell', { command: 'pm', args: ['list', 'packages', pkg] })], ['resolve', () => ex('mobile: shell', { command: 'cmd', args: ['package', 'resolve-activity', '--brief', pkg] })], ['abi', () => ex('mobile: shell', { command: 'getprop', args: ['ro.product.cpu.abilist'] })]]) {
+              try { console.log('DIAG ' + n + ': ' + JSON.stringify(await f())); } catch (e2) { console.log('DIAG ' + n + ' failed: ' + String(e2.message).slice(0, 200)); }
+            }
+            await shot('failed'); process.exit(1);
+          }
+          await sleep(12000);
+          let src = await shot('launch'); console.log('T_FIRST', Date.now());
+          check('app in foreground after launch', src.includes(pkg));
+          await sleep(5000);
+          src = await shot('after-5s');
+          check('app still in foreground 5s later', src.includes(pkg));
+          const st = await call('POST', `/session/${sid}/execute/sync`, { script: 'mobile: queryAppState', args: [{ appId: pkg }] });
+          console.log('APP_STATE', st); check('app state is running in foreground (4)', st === 4);
+          await call('DELETE', `/session/${sid}`).catch(() => {});
+          console.log('T_END', Date.now());
+          process.exit(out.every(Boolean) ? 0 : 1);
+          JS
+          cat > spawndroid.yaml <<'YAML'
+          version: 1
+          app: app.apk
+          command: [node, t.mjs]
+          profile: android-14-phone
+          timeout: 900
+          YAML
+      - name: Run on Spawndroid
+        run: |
+          date +%s.%N > /tmp/t_run0
+          set +e
+          npx --yes spawndroid@latest --version
+          npx --yes spawndroid@latest check
+          npx --yes spawndroid@latest run 2>&1 | tee test.log
+          rc=${PIPESTATUS[0]}
+          date +%s.%N > /tmp/t_end
+          python3 - <<'PY'
+          f=lambda p: float(open(p).read())
+          print('TIMING download_s=%.1f check_plus_run_s=%.1f total_s=%.1f' % (f('/tmp/t_dl')-f('/tmp/t0'), f('/tmp/t_end')-f('/tmp/t_run0'), f('/tmp/t_end')-f('/tmp/t0')))
+          PY
+          exit $rc
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: spawndroid-run
+          path: |
+            shots
+            test.log
